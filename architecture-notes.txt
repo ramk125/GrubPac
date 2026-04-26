@@ -1,0 +1,52 @@
+# Architecture Notes - Content Broadcasting System
+
+## Authentication & RBAC Flow
+- Implemented using JWT (JSON Web Tokens) and bcrypt for password hashing.
+- A central `auth` middleware intercepts requests, validates the token using `jsonwebtoken`, retrieves the user from the DB, and checks the `role` property (`PRINCIPAL` / `TEACHER`).
+- Only verified Teachers can upload content, and only verified Principals can approve or reject them.
+
+## Subject-based System Design
+- Content is grouped by a generic `subject` string.
+- In `ContentSlot`, each subject gets its own dedicated slot. Content is dynamically filtered and grouped by this `subject` field on retrieval.
+- The public API allows an optional `?subject=` query parameter. If provided, the system returns only that subject's active content. Without it, the system loops over all subjects and returns a list of active contents, one for each subject.
+
+## Upload Handling Approach
+- Implemented using `multer`.
+- Files are saved directly to a local `/uploads` directory for simplicity (S3 can be enabled with a custom Multer Storage engine).
+- The `upload.middleware.js` explicitly configures limits (10MB max) and uses a file filter to restrict MIME types strictly to JPG, PNG, and GIF.
+
+## Approval Workflow Design
+- Teacher uploads content (Status defaults to `PENDING`).
+- Principal retrieves a list of pending items via `/api/principal/content/pending`.
+- Principal calls the approval endpoint (`PATCH /api/principal/content/:id/approve`), which updates the status to `APPROVED` and dynamically creates/assigns a `ContentSchedule` to place the content into the subject's broadcast rotation.
+- If rejected, a `rejection_reason` is updated, and the status changes to `REJECTED`.
+
+## Scheduling/Rotation Logic (VERY IMPORTANT)
+- Cron jobs/background workers were intentionally avoided to ensure state reliability across auto-scaled or serverless instances.
+- Instead, rotation is calculated **on-the-fly** at request time inside `scheduling.service.js`.
+- The logic fetches all active, `APPROVED` content falling within the teacher's configured `start_time` and `end_time`.
+- For each subject, the algorithm sums the `duration` of each scheduled item to find the *Total Loop Duration*.
+- Using the system's Unix epoch, it finds the exact playback offset using modulo arithmetic: `current_offset = time_elapsed % total_loop`.
+- It then walks the schedule array (ordered by insertion) and checks which item's subset duration encapsulates the current offset. The matching item is returned as the single active "live" content.
+- This creates an exact, synchronized rotation window that is consistent regardless of when the student requests the data.
+
+## Database Design Decisions
+- Using **Prisma ORM** coupled securely with SQLite for immediate porting ease (easily swapped to PostgreSQL by changing the `provider` in `schema.prisma`).
+- We employ three core entities for content broadcasting explicitly: User, Content, and ContentSchedule. The `duration` allows fine-grained pacing. Note that we store the file metadata securely inside `Content`.
+
+## Folder Structure
+We follow a modular MVC-style project pattern:
+- `src/controllers` -> Handler logic processing inputs and outputs.
+- `src/routes` -> Grouping related endpoints.
+- `src/services` -> Heavy business/math logic out of controllers.
+- `src/middlewares` -> Reusable logic blocks (auth, uploads).
+
+## Middleware Usage
+- `auth.middleware.js`: For robust token checking and RBAC (Roles base execution).
+- `upload.middleware.js`: Handling multipart/form-data.
+- Standard libraries: `helmet` (security headers), `cors` (cross-origin compatibility).
+
+## Scalability Approach (caching, queues, etc.)
+- **Caching**: The `/live` endpoint reads DB state multiple times per second natively. Ideally, Redis caching is implemented here where the cache persists until an approval/upload event invalidates it, or the rotation pointer shifts.
+- **Microservices**: Image parsing / AWS S3 uploads could be offset to a background queue system (RabbitMQ / BullMQ) to avoid blocking the main server loop thread when multiple 10MB images are uploaded simultaneously.
+- **Database**: We would shard reads/writes explicitly across PostgreSQL replicas, reading the `live` data from rapid read-replicas.
